@@ -2,6 +2,9 @@ import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
+import jwt from "jsonwebtoken";
+import { WebSocketServer } from "ws";
+import { Client as StompServer } from "@stomp/stompjs"; // server üçün istifadə olunur
 
 import User from "./models/User.js";
 import Message from "./models/Message.js";
@@ -14,11 +17,10 @@ app.use(express.json());
 // MongoDB qoşulma
 mongoose.set("strictQuery", true);
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => {})
-  .catch(err => {});
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.error("MongoDB error:", err));
 
 /* ---------- USER ROUTES ---------- */
-// bütün userləri götür
 app.get("/users", async (req, res) => {
   try {
     const users = await User.find();
@@ -28,19 +30,25 @@ app.get("/users", async (req, res) => {
   }
 });
 
-// yeni user əlavə et
 app.post("/users", async (req, res) => {
   try {
     const newUser = new User(req.body);
     await newUser.save();
-    res.json(newUser);
+
+    // Token yaradılır
+    const token = jwt.sign(
+      { username: newUser.username, userId: newUser._id },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+
+    res.json({ user: newUser, token });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 /* ---------- MESSAGE ROUTES ---------- */
-// bütün mesajları götür
 app.get("/messages", async (req, res) => {
   try {
     const msgs = await Message.find().sort({ createdAt: -1 });
@@ -50,7 +58,6 @@ app.get("/messages", async (req, res) => {
   }
 });
 
-// yeni mesaj əlavə et
 app.post("/messages", async (req, res) => {
   try {
     const newMsg = new Message(req.body);
@@ -61,23 +68,60 @@ app.post("/messages", async (req, res) => {
   }
 });
 
-// mesaj update et (read/delete status və s.)
-app.put("/messages/:id", async (req, res) => {
-  try {
-    const updated = await Message.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true }
-    );
-    if (!updated) {
-      return res.status(404).json({ error: "Message not found" });
-    }
-    res.json(updated);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+/* ---------- WEBSOCKET ---------- */
+const server = app.listen(process.env.PORT || 5000, () => {
+  console.log(`Server listening on ${process.env.PORT || 5000}`);
 });
 
-/* ---------- SERVER START ---------- */
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {});
+// Native WebSocket server
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (ws, req) => {
+  console.log("WebSocket: connection attempt");
+
+  // Token yoxlaması
+  const token = req.headers["authorization"]?.split(" ")[1];
+  if (!token) {
+    ws.send(JSON.stringify({ error: "No token provided" }));
+    return ws.close();
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log("WebSocket authorized:", decoded.username);
+
+    // STOMP kimi mesaj göndərmək
+    ws.on("message", async (msg) => {
+      try {
+        const data = JSON.parse(msg);
+
+        // Mesaj DB-yə əlavə et
+        const newMsg = new Message({
+          chatId: data.chatId,
+          senderId: decoded.userId,
+          cipherText: data.cipherText,
+          createdAt: new Date(),
+        });
+        await newMsg.save();
+
+        // Bütün bağlı client-lərə göndər
+        wss.clients.forEach((client) => {
+          if (client.readyState === ws.OPEN) {
+            client.send(JSON.stringify({
+              chatId: data.chatId,
+              senderId: decoded.userId,
+              cipherText: data.cipherText,
+              createdAt: newMsg.createdAt,
+            }));
+          }
+        });
+      } catch (err) {
+        console.error("WS message error:", err.message);
+      }
+    });
+
+  } catch (err) {
+    ws.send(JSON.stringify({ error: "Invalid token" }));
+    ws.close();
+  }
+});
